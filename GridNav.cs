@@ -131,18 +131,28 @@ public struct BigIntegerCoordinate
     }
 }
 
-// one jump record
-// 1) HistoryEntry now records both source and target
+// one jump record: source/target line ids plus exact endpoints (reversal uses coordinates, not ray math)
 public struct HistoryEntry
 {
     public Direction Dir;
-    public int SourceLineID; // ID of the line segment you started on
-    public int TargetLineID; // ID of the line you jumped to
-    public HistoryEntry(Direction dir, int src, int tgt)
+    public int SourceLineID;
+    public int TargetLineID;
+    public BigInteger FromX;
+    public BigInteger FromY;
+    public BigInteger ToX;
+    public BigInteger ToY;
+
+    public HistoryEntry(
+        Direction dir, int src, int tgt,
+        BigInteger fromX, BigInteger fromY, BigInteger toX, BigInteger toY)
     {
         Dir = dir;
         SourceLineID = src;
         TargetLineID = tgt;
+        FromX = fromX;
+        FromY = fromY;
+        ToX = toX;
+        ToY = toY;
     }
 }
 
@@ -318,7 +328,7 @@ public class DiagonalLineDefinition : LineDefinition
 }
 
 
-public partial class LineRegistry
+public class LineRegistry
 {
     // These fields are now pre-populated with environment lines only
     public ConcurrentDictionary<string, int> _keyToId = new ConcurrentDictionary<string, int>();
@@ -465,8 +475,8 @@ public partial class LineRegistry
         // Read the file
         string jsonString = File.ReadAllText(filePath);
 
-        // Deserialize to model
-        var model = JsonSerializer.Deserialize<LineRegistrySerializationModel>(jsonString, options);
+        var model = JsonSerializer.Deserialize<LineRegistrySerializationModel>(jsonString, options)
+            ?? throw new InvalidOperationException("Invalid or empty registry JSON.");
 
         // Create and populate a new LineRegistry
         var registry = new LineRegistry
@@ -487,11 +497,11 @@ public partial class LineRegistry
 // Model class for serialization
 public class LineRegistrySerializationModel
 {
-    public ConcurrentDictionary<string, int> KeyToId { get; set; }
-    public ConcurrentDictionary<int, LineDefinition> IdToDef { get; set; }
-    public List<int> DiagPlus { get; set; }
-    public List<int> DiagMinus { get; set; }
-    public int MaxEnvExp { get; set; } // Renamed from EnvCount to be more descriptive
+    public ConcurrentDictionary<string, int> KeyToId { get; set; } = new();
+    public ConcurrentDictionary<int, LineDefinition> IdToDef { get; set; } = new();
+    public List<int> DiagPlus { get; set; } = new();
+    public List<int> DiagMinus { get; set; } = new();
+    public int MaxEnvExp { get; set; }
 }
 
 // Custom converter for LineDefinition classes, now strictly for exponent-based lines
@@ -569,6 +579,21 @@ public class LineDefinitionConverter : JsonConverter<LineDefinition>
     }
 }
 
+/// <summary>
+/// Result of <see cref="ExponentialGridNavigator.Run"/>: final position on power-of-2 lines, path length, and registry for export.
+/// </summary>
+public sealed record NavigationOutcome(
+    string Name,
+    BigInteger StartX,
+    BigInteger StartY,
+    BigInteger FinalX,
+    BigInteger FinalY,
+    BigInteger MLR,
+    int PowerExponentX,
+    int PowerExponentY,
+    int StepCount,
+    IReadOnlyList<HistoryEntry> History,
+    LineRegistry Registry);
 
 // Modified navigation algorithm that only uses power-of-2 lines
 public static class ExponentialGridNavigator
@@ -725,170 +750,6 @@ public static class ExponentialGridNavigator
         }
     }
 
-    // Modified bisection step that only jumps to power-of-2 lines
-    // Modified bisection step that only jumps to power-of-2 lines
-    private static (BigIntegerCoordinate NewPos, int LineID, Direction Dir)
-    old_NextBisectionStep_original(BigIntegerCoordinate p0, LineRegistry registry)
-    {
-        BigInteger error = p0.Y - p0.X;
-        Direction dir = error < 0 ? Direction.NW : Direction.SE; // Direction to reduce |Y-X|
-        BigInteger dx = DX[(int)dir];
-        BigInteger dy = DY[(int)dir];
-
-        // Priority 1: If on y=x (error.IsZero), align X to nearest power of 2
-        // This move ensures progress towards a power-of-2 structure when error is zero
-        if (error.IsZero)
-        {
-            int kx = (p0.X.Sign > 0) ? LineMath.FloorLog2(p0.X) : 0;
-            BigInteger twoK_X = LineMath.Pow2(kx);
-            BigInteger nextTwoK_X = LineMath.Pow2(kx + 1);
-
-            BigInteger targetX;
-            int targetExp;
-
-            // If p0.X is already a power of two, we must choose a *different* power of two to make progress.
-            // Typically, this means moving to the next higher power of two.
-            if (p0.X == twoK_X)
-            {
-                targetX = nextTwoK_X;
-                targetExp = kx + 1;
-            }
-            // If p0.X is not a power of two, choose the closest power of two.
-            else if (BigInteger.Abs(p0.X - twoK_X) <= BigInteger.Abs(p0.X - nextTwoK_X))
-            {
-                targetX = twoK_X;
-                targetExp = kx;
-            }
-            else
-            {
-                targetX = nextTwoK_X;
-                targetExp = kx + 1;
-            }
-
-            Direction moveDir = (p0.X < targetX) ? Direction.E : Direction.W;
-
-            // Ensure targetExp is within environment bounds
-            if (targetExp > registry._maxEnvExp) targetExp = registry._maxEnvExp;
-            else if (targetExp < 0) targetExp = 0;
-
-            var targetLine = new VerticalLineDefinition(targetExp);
-            int targetLineId = registry.GetEnvironmentLineId(targetLine);
-
-            BigInteger newX = targetX;
-            BigInteger newY = p0.Y; // Y coordinate does not change for E/W move
-
-            return (new BigIntegerCoordinate(newX, newY), targetLineId, moveDir);
-        }
-
-        // Priority 2: Try diagonal lines to reduce |Y-X| error
-        BigInteger absErr = BigInteger.Abs(error);
-
-        // Strategically select candidate exponents 'k' for diagonal C = +/- (2^k - 1)
-        int k_approx_log_err = (absErr.IsZero || absErr.IsOne) ? 0 : LineMath.FloorLog2(absErr); // Use FloorLog2(absErr) for C ~ absErr
-
-        var candidateExponents = new List<int>();
-        // k_ideal aims for C to be just under absErr. C = 2^k - 1. So 2^k ~ absErr. k ~ log2(absErr)
-        if (k_approx_log_err > 0) candidateExponents.Add(k_approx_log_err);     // k closest to log2(absErr)
-        if (k_approx_log_err > 1) candidateExponents.Add(k_approx_log_err - 1); // k-1
-        if (k_approx_log_err > 2) candidateExponents.Add(k_approx_log_err - 2); // k-2
-
-        // Add an exponent that would give C with roughly half the bits of absErr.
-        // This provides a jump of a significantly different scale.
-        if (k_approx_log_err > 10) candidateExponents.Add(k_approx_log_err / 2);
-
-        // Add some smaller, fixed exponents which are often useful, especially as absErr gets smaller.
-        candidateExponents.Add(Math.Min(10, k_approx_log_err));
-        candidateExponents.Add(Math.Min(5, k_approx_log_err));
-        candidateExponents.Add(Math.Min(1, k_approx_log_err));
-        candidateExponents.Add(0); // Always consider k=0 (C = 0 for positive=true, C=-0 for positive=false) which is y=x.
-
-        var distinctValidExponents = candidateExponents
-            .Where(exp => exp >= 0 && exp <= registry._maxEnvExp) // Must be valid and within environment
-            .Distinct()
-            .OrderByDescending(exp => exp) // Process larger k first, aiming for bigger error reduction
-            .ToList();
-
-        BigInteger bestAbsNewErr = BigInteger.Abs(error); // Initialize with current error
-        BigInteger bestT = BigInteger.MinusOne; // Use MinusOne to ensure first valid t > 0 is chosen
-        BigInteger bestX = BigInteger.Zero;
-        BigInteger bestY = BigInteger.Zero;
-        int bestLineId = -1;
-        bool foundDiagonal = false;
-
-        for (int idx = 0; idx < distinctValidExponents.Count; idx++)
-        {
-            int exp = distinctValidExponents[idx];
-
-            // Determine the sign of the intercept C for slope +1 lines.
-            // If error > 0 (Y > X), we want C < error. Prefer y-x = +(2^k - 1). So targetPositiveC = true.
-            // If error < 0 (Y < X), we want C > error. Prefer y-x = -(2^k - 1). So targetPositiveC = false.
-            bool targetPositiveC = (error > 0);
-
-            var diagLine = new DiagonalLineDefinition(1, exp, targetPositiveC);
-            int diagLineId = registry.GetEnvironmentLineId(diagLine); // Exponent already checked to be within bounds
-
-            if (diagLine.TryIntersect(p0, dx, dy, out BigInteger t, out BigInteger x1, out BigInteger y1))
-            {
-                if (t.Sign <= 0) continue; // Must move forward (t > 0)
-
-                BigInteger newErr = y1 - x1;
-                BigInteger absNewErr = BigInteger.Abs(newErr);
-
-                if (absNewErr < bestAbsNewErr ||
-                    (absNewErr == bestAbsNewErr && (bestT.Sign < 0 || t < bestT)))
-                {
-                    foundDiagonal = true;
-                    bestAbsNewErr = absNewErr;
-                    bestT = t;
-                    bestLineId = diagLineId;
-                    bestX = x1;
-                    bestY = y1;
-                }
-            }
-        }
-
-        if (foundDiagonal)
-        {
-            return (new BigIntegerCoordinate(bestX, bestY), bestLineId, dir);
-        }
-
-        // Priority 3: Fallback to nearest vertical/horizontal power-of-2 line
-        int currentExpX = (p0.X.Sign > 0) ? LineMath.FloorLog2(p0.X) : 0;
-        int currentExpY = (p0.Y.Sign > 0) ? LineMath.FloorLog2(p0.Y) : 0;
-
-        if (!dx.IsZero) // If moving diagonally or East/West
-        {
-            int targetExp = (dx.Sign > 0) ? currentExpX + 1 : Math.Max(0, currentExpX - 1);
-            targetExp = Math.Min(targetExp, registry._maxEnvExp); // Cap at max environment exp
-            targetExp = Math.Max(targetExp, 0);                   // Ensure non-negative
-
-            var vLine = new VerticalLineDefinition(targetExp);
-            int vLineId = registry.GetEnvironmentLineId(vLine);
-
-            if (vLine.TryIntersect(p0, dx, dy, out BigInteger tv, out BigInteger xv, out BigInteger yv) && tv.Sign > 0)
-            {
-                return (new BigIntegerCoordinate(xv, yv), vLineId, dir);
-            }
-        }
-
-        if (!dy.IsZero) // If moving diagonally or North/South
-        {
-            int targetExp = (dy.Sign > 0) ? currentExpY + 1 : Math.Max(0, currentExpY - 1);
-            targetExp = Math.Min(targetExp, registry._maxEnvExp); // Cap at max environment exp
-            targetExp = Math.Max(targetExp, 0);                   // Ensure non-negative
-
-            var hLine = new HorizontalLineDefinition(targetExp);
-            int hLineId = registry.GetEnvironmentLineId(hLine);
-
-            if (hLine.TryIntersect(p0, dx, dy, out BigInteger th, out BigInteger xh, out BigInteger yh) && th.Sign > 0)
-            {
-                return (new BigIntegerCoordinate(xh, yh), hLineId, dir);
-            }
-        }
-
-        throw new InvalidOperationException($"CRITICAL: No valid navigation step found for position {p0} with chosen direction {dir}. This indicates a flaw in fallback logic or insufficient environment lines.");
-    }
-
     // Modified termination check that ensures BOTH axes are within MLR of a power of 2
     private static bool IsWithinToleranceBoth(
         BigIntegerCoordinate p,
@@ -946,50 +807,105 @@ public static class ExponentialGridNavigator
         return okX && okY;
     }
 
-    // Move exactly to a power-of-2 line
-    private static (BigIntegerCoordinate NewPos, int LineID)
-    MoveToExactPowerOfTwo(BigIntegerCoordinate p0, int currentLineID, char axis, int targetExp, LineRegistry registry, List<HistoryEntry> history)
+    private static bool IsPointOnLine(BigIntegerCoordinate p, LineDefinition def)
     {
-        // For reversibility, these "snap" moves are recorded as directional moves to a power-of-two line.
-        // The ReversePath will then attempt to intersect back from the target line.
-        // This relies on the forward history recording SourceLineID (the line 'pos' was just on) and TargetLineID (the new line).
-
-        if (axis == 'X')
+        return def switch
         {
-            var targetLine = new VerticalLineDefinition(targetExp);
-            // Ensure targetExp is within environment bounds (already handled by registry.GetEnvironmentLineId)
-            int targetLineId = registry.GetEnvironmentLineId(targetLine);
-            BigInteger targetX = LineMath.Pow2(targetExp);
+            VerticalLineDefinition v => p.X == v.X0,
+            HorizontalLineDefinition h => p.Y == h.Y0,
+            DiagonalLineDefinition d => (BigInteger)d.Slope * p.X + d.C - p.Y == 0,
+            _ => false
+        };
+    }
 
-            Direction dir = p0.X < targetX ? Direction.E : Direction.W;
-
-            // The "move" is from current position (p0.X, p0.Y) to (targetX, p0.Y).
-            // This is a horizontal move.
-            var newPos = new BigIntegerCoordinate(targetX, p0.Y);
-            history.Add(new HistoryEntry(dir, currentLineID, targetLineId));
-
-            return (newPos, targetLineId);
-        }
-        else // axis == 'Y'
+    /// <summary>
+    /// When several environment lines meet (e.g. corner of the power-of-2 grid), pick a stable id
+    /// so history stays consistent with geometry. Prefers vertical, then horizontal, then diagonals.
+    /// </summary>
+    private static bool TryGetCanonicalLineIdAtPoint(BigIntegerCoordinate p, LineRegistry registry, out int lineId)
+    {
+        lineId = 0;
+        if (p.X.Sign > 0 && LineMath.IsPowerOfTwo(p.X))
         {
-            var targetLine = new HorizontalLineDefinition(targetExp);
-            // Ensure targetExp is within environment bounds (already handled by registry.GetEnvironmentLineId)
-            int targetLineId = registry.GetEnvironmentLineId(targetLine);
-            BigInteger targetY = LineMath.Pow2(targetExp);
-
-            Direction dir = p0.Y < targetY ? Direction.N : Direction.S;
-
-            // The "move" is from current position (p0.X, p0.Y) to (p0.X, targetY).
-            // This is a vertical move.
-            var newPos = new BigIntegerCoordinate(p0.X, targetY);
-            history.Add(new HistoryEntry(dir, currentLineID, targetLineId));
-
-            return (newPos, targetLineId);
+            int ex = LineMath.FloorLog2(p.X);
+            if (ex <= registry._maxEnvExp)
+            {
+                lineId = registry.GetEnvironmentLineId(new VerticalLineDefinition(ex));
+                return true;
+            }
         }
+
+        if (p.Y.Sign > 0 && LineMath.IsPowerOfTwo(p.Y))
+        {
+            int ey = LineMath.FloorLog2(p.Y);
+            if (ey <= registry._maxEnvExp)
+            {
+                lineId = registry.GetEnvironmentLineId(new HorizontalLineDefinition(ey));
+                return true;
+            }
+        }
+
+        for (int exp = registry._maxEnvExp; exp >= 0; exp--)
+        {
+            foreach (bool pos in new[] { true, false })
+            {
+                var d = new DiagonalLineDefinition(1, exp, pos);
+                if (IsPointOnLine(p, d))
+                {
+                    lineId = registry.GetEnvironmentLineId(d);
+                    return true;
+                }
+            }
+
+            var dm = new DiagonalLineDefinition(-1, exp);
+            if (IsPointOnLine(p, dm))
+            {
+                lineId = registry.GetEnvironmentLineId(dm);
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static int CanonicalLineIdAtPoint(BigIntegerCoordinate p, LineRegistry registry)
+    {
+        if (TryGetCanonicalLineIdAtPoint(p, registry, out int lineId))
+            return lineId;
+        throw new InvalidOperationException($"No environment line contains point {p}.");
+    }
+
+    /// <summary>
+    /// Forward history records <paramref name="forwardDir"/>; reverse uses the opposite ray.
+    /// The dummy step must pick <paramref name="forwardDir"/> so that from <paramref name="pos"/>,
+    /// a ray toward the source line along the reverse direction actually hits that line (t ≥ 0).
+    /// </summary>
+    private static Direction PickReversibleDummyDirection(BigIntegerCoordinate pos, LineDefinition srcDef)
+    {
+        for (int d = 0; d < 8; d++)
+        {
+            var forwardDir = (Direction)d;
+            var revDir = (Direction)(((int)forwardDir + 4) % 8);
+            if (srcDef.TryIntersect(pos, DX[(int)revDir], DY[(int)revDir],
+                    out BigInteger t, out _, out _) && t > 0)
+                return forwardDir;
+        }
+
+        for (int d = 0; d < 8; d++)
+        {
+            var forwardDir = (Direction)d;
+            var revDir = (Direction)(((int)forwardDir + 4) % 8);
+            if (srcDef.TryIntersect(pos, DX[(int)revDir], DY[(int)revDir],
+                    out BigInteger t, out _, out _) && t >= 0)
+                return forwardDir;
+        }
+
+        throw new InvalidOperationException(
+            $"No reversible dummy direction from {pos} toward source line {srcDef.Key}.");
     }
 
     // Main navigation function 
-    public static BigInteger Run(BigInteger startNumber, BigInteger MLR, string name)
+    public static NavigationOutcome Run(BigInteger startNumber, BigInteger MLR, string name)
     {
         // ------------------------------------------------------------------
         // 1 – build environment
@@ -1049,13 +965,37 @@ public static class ExponentialGridNavigator
                 prevAbsErr = -1;
             }
 
-            history.Add(new HistoryEntry(step.Dir, currentLineID, step.LineID));
+            var srcLineDefPre = registry.GetLineDefinition(currentLineID);
+            int resolvedSource = IsPointOnLine(pos, srcLineDefPre)
+                ? currentLineID
+                : (TryGetCanonicalLineIdAtPoint(pos, registry, out int srcCanon) ? srcCanon : currentLineID);
+
+            var stepTargetDef = registry.GetLineDefinition(step.LineID);
+            int resolvedTarget = step.LineID;
+            if (!IsPointOnLine(step.NewPos, stepTargetDef) &&
+                TryGetCanonicalLineIdAtPoint(step.NewPos, registry, out int canonId))
+                resolvedTarget = canonId;
+
+            // Align mode can emit N/S steps that only swap horizontal vs vertical line id at a
+            // corner (2^k, 2^k) with no motion. Those are t=0 in reverse and break earlier real moves.
+            history.Add(new HistoryEntry(
+                step.Dir,
+                resolvedSource,
+                resolvedTarget,
+                pos.X,
+                pos.Y,
+                step.NewPos.X,
+                step.NewPos.Y));
             pos = step.NewPos;
-            currentLineID = step.LineID;
+            currentLineID = resolvedTarget;
 
             if (++iter > 100_000)
                 throw new InvalidOperationException("Navigation did not converge");
         }
+
+        if (!IsPointOnLine(pos, registry.GetLineDefinition(currentLineID)) &&
+            TryGetCanonicalLineIdAtPoint(pos, registry, out int preSnapLine))
+            currentLineID = preSnapLine;
 
         // ------------------------------------------------------------------
         // 4 – final exact snaps
@@ -1070,25 +1010,24 @@ public static class ExponentialGridNavigator
             if (pos.X != targetX)           // real horizontal move
             {
                 Direction dir = pos.X < targetX ? Direction.E : Direction.W;
-                history.Add(new HistoryEntry(dir, currentLineID, vId));
+                var fx = pos.X;
+                var fy = pos.Y;
+                history.Add(new HistoryEntry(dir, currentLineID, vId, fx, fy, targetX, fy));
                 pos = new BigIntegerCoordinate(targetX, pos.Y);
                 currentLineID = vId;
             }
-            else if (currentLineID != vId)  // ---- dummy step  (FIX-2) ----
+            else if (currentLineID != vId)  // ---- bookkeeping: already on x = 2^k geometrically ----
             {
                 var srcDef = registry.GetLineDefinition(currentLineID);
-
-                // try East first
-                Direction dummyDir = Direction.E;
-                if (!srcDef.TryIntersect(pos, DX[(int)dummyDir], DY[(int)dummyDir],
-                                         out BigInteger t, out _, out _) || t < 0)
+                var tgtDef = registry.GetLineDefinition(vId);
+                if (IsPointOnLine(pos, srcDef) && IsPointOnLine(pos, tgtDef))
+                    currentLineID = vId;
+                else
                 {
-                    dummyDir = Direction.W;           // West will work, otherwise we
-                                                      // (impossible with our grid)     // would have to throw
+                    Direction dummyDir = PickReversibleDummyDirection(pos, srcDef);
+                    history.Add(new HistoryEntry(dummyDir, currentLineID, vId, pos.X, pos.Y, pos.X, pos.Y));
+                    currentLineID = vId;
                 }
-
-                history.Add(new HistoryEntry(dummyDir, currentLineID, vId));
-                currentLineID = vId;
             }
         }
 
@@ -1101,38 +1040,79 @@ public static class ExponentialGridNavigator
             if (pos.Y != targetY)           // real vertical move
             {
                 Direction dir = pos.Y < targetY ? Direction.N : Direction.S;
-                history.Add(new HistoryEntry(dir, currentLineID, hId));
+                var fx = pos.X;
+                var fy = pos.Y;
+                history.Add(new HistoryEntry(dir, currentLineID, hId, fx, fy, fx, targetY));
                 pos = new BigIntegerCoordinate(pos.X, targetY);
                 currentLineID = hId;
             }
-            else if (currentLineID != hId)  // ---- dummy step  (FIX-2) ----
+            else if (currentLineID != hId)  // ---- bookkeeping: already on y = 2^k geometrically ----
             {
                 var srcDef = registry.GetLineDefinition(currentLineID);
-
-                Direction dummyDir = Direction.N;
-                if (!srcDef.TryIntersect(pos, DX[(int)dummyDir], DY[(int)dummyDir],
-                                         out BigInteger t, out _, out _) || t < 0)
+                var tgtDef = registry.GetLineDefinition(hId);
+                if (IsPointOnLine(pos, srcDef) && IsPointOnLine(pos, tgtDef))
+                    currentLineID = hId;
+                else
                 {
-                    dummyDir = Direction.S;           // opposite direction
+                    Direction dummyDir = PickReversibleDummyDirection(pos, srcDef);
+                    history.Add(new HistoryEntry(dummyDir, currentLineID, hId, pos.X, pos.Y, pos.X, pos.Y));
+                    currentLineID = hId;
                 }
-
-                history.Add(new HistoryEntry(dummyDir, currentLineID, hId));
-                currentLineID = hId;
             }
         }
 
         // ------------------------------------------------------------------
         // 5 – reverse path verification
         // ------------------------------------------------------------------
-        var recovered = ReversePath(pos, history, registry);
+        var recovered = ReversePath(pos, history);
         if (recovered.X != startNumber || recovered.Y != 1)
             throw new InvalidOperationException($"Reverse failed – got {recovered}");
 
-        Console.WriteLine("Path recovery successful!");
-        return recovered.X;
+        return new NavigationOutcome(
+            name,
+            startNumber,
+            BigInteger.One,
+            pos.X,
+            pos.Y,
+            MLR,
+            finalExpX,
+            finalExpY,
+            history.Count,
+            history,
+            registry);
     }
 
-    // You need to rename your previous NextBisectionStep to this:
+    /// <summary>Writes registry.json, history.json, and pos.json under <paramref name="outputDirectory"/>.</summary>
+    public static void WriteRunArtifacts(NavigationOutcome outcome, string outputDirectory)
+    {
+        Directory.CreateDirectory(outputDirectory);
+        outcome.Registry.SaveToFile(Path.Combine(outputDirectory, "registry.json"));
+        var historyOpts = new JsonSerializerOptions
+        {
+            WriteIndented = true,
+            IncludeFields = true,
+            Converters = { new JsonStringEnumConverter() }
+        };
+        File.WriteAllText(
+            Path.Combine(outputDirectory, "history.json"),
+            JsonSerializer.Serialize(outcome.History, historyOpts));
+
+        var posDoc = new
+        {
+            outcome.Name,
+            Start = new { X = outcome.StartX.ToString(), Y = outcome.StartY.ToString() },
+            Final = new { X = outcome.FinalX.ToString(), Y = outcome.FinalY.ToString() },
+            MLR = outcome.MLR.ToString(),
+            PowerExponentX = outcome.PowerExponentX,
+            PowerExponentY = outcome.PowerExponentY,
+            StepCount = outcome.StepCount,
+            ReversePathVerified = true
+        };
+        File.WriteAllText(
+            Path.Combine(outputDirectory, "pos.json"),
+            JsonSerializer.Serialize(posDoc, new JsonSerializerOptions { WriteIndented = true }));
+    }
+
     private static (BigIntegerCoordinate NewPos, int LineID, Direction Dir)
         NextBisectionStep_Original(BigIntegerCoordinate p0, LineRegistry registry)
     {
@@ -1276,48 +1256,22 @@ public static class ExponentialGridNavigator
         throw new InvalidOperationException($"CRITICAL: No valid navigation step found for position {p0} with chosen direction {dir} in NextBisectionStep_Original.");
     }
 
-    // ReversePath remains mostly the same
-    public static BigIntegerCoordinate ReversePath(
-        BigIntegerCoordinate endPos,
-        List<HistoryEntry> history,
-        LineRegistry registry)
+    /// <summary>Walks the recorded segment endpoints backward (no ray/line intersection, so corners are unambiguous).</summary>
+    public static BigIntegerCoordinate ReversePath(BigIntegerCoordinate endPos, List<HistoryEntry> history)
     {
         var pos = endPos;
         for (int i = history.Count - 1; i >= 0; i--)
         {
             var e = history[i];
-            var revDir = (Direction)(((int)e.Dir + 4) % 8); // Opposite direction
-
-            // In reverse, the 'SourceLineID' of a history entry was the line the point was *on* before the forward step.
-            // This 'SourceLineID' is the line we must now intersect with moving in 'revDir' from current 'pos'.
-            var srcDef = registry.GetLineDefinition(e.SourceLineID);
-            var dx = DX[(int)revDir];
-            var dy = DY[(int)revDir];
-
-            // TryIntersect calculates 't' (distance) and the intersection point (x0, y0).
-            // If the current 'pos' is already ON the 'srcDef' line, TryIntersect will return t=0.
-            // For general bisection steps, 't' should be > 0.
-            // For 'snap' steps, if 'pos' (the final snapped position) happens to be on the *previous* source line (e.g. H_J),
-            // then t=0 will occur. However, the logical previous point (before snap) was NOT necessarily on H_J.
-            // Given the constraints (exponent-only lines, reversible history),
-            // we rely on the mathematical properties of lines and the `TryIntersect` function.
-            // A failure here indicates an inconsistency, often due to t=0 for steps that logically moved a distance.
-            if (!srcDef.TryIntersect(pos, dx, dy,
-                                     out BigInteger t,
-                                     out BigInteger x0,
-                                     out BigInteger y0))
+            if (pos.X != e.ToX || pos.Y != e.ToY)
             {
-                throw new InvalidOperationException($"ReversePath intersection failed at step {i}. Current pos: {pos}, Reverse Dir: {revDir}, Source Line: {srcDef.Key}. No valid intersection found for t >= 0.");
+                throw new InvalidOperationException(
+                    $"ReversePath mismatch at step {i}: at ({pos.X},{pos.Y}), expected jump end ({e.ToX},{e.ToY}).");
             }
 
-            // Crucial: If t is zero, it means 'pos' is ALREADY on 'srcDef'. This implies no movement
-            // happened in reverse. For actual jumps (where t > 0 forward), this is fine.
-            // For snaps, if pos was (A, B) and snapped to (A_power_of_2, B), and then reversed,
-            // (A_power_of_2, B) is now 'pos', and if srcDef was V_A_power_of_2, t=0.
-            // The path implicitly works because (x0,y0) is returned as the new position, even if t=0.
-            // The primary success criterion is that the final recovered.X and Y match the start.
-            pos = new BigIntegerCoordinate(x0, y0);
+            pos = new BigIntegerCoordinate(e.FromX, e.FromY);
         }
+
         return pos;
     }
 }
